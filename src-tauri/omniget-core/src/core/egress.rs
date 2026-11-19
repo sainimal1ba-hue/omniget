@@ -240,12 +240,72 @@ fn host_addresses() -> io::Result<BTreeSet<IpAddr>> {
         Ok(result)
     }
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn host_addresses() -> io::Result<BTreeSet<IpAddr>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "EGRESS_HOST_INTERFACES_UNAVAILABLE",
-    ))
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+    };
+
+    // The loopback pseudo-interface reports no unicast addresses through
+    // GetAdaptersAddresses, so the loopback addresses getifaddrs lists on
+    // Unix are added here to keep both platforms identical.
+    let mut result = BTreeSet::from([
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        std::net::Ipv6Addr::LOCALHOST,
+    ]);
+
+    let mut size: u32 = 15 * 1024;
+    for _ in 0..3 {
+        // IP_ADAPTER_ADDRESSES_LH holds pointers, so the buffer is u64 for
+        // pointer alignment.
+        let mut buffer: Vec<u64> = vec![0; size.div_ceil(8) as usize];
+        let adapters = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+        let error = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                0,
+                std::ptr::null_mut(),
+                adapters,
+                &mut size,
+            )
+        };
+        match error {
+            ERROR_SUCCESS => {
+                let mut node = adapters;
+                while !node.is_null() {
+                    let mut unicast = unsafe { (*node).FirstUnicastAddress };
+                    while !unicast.is_null() {
+                        let address = unsafe { (*unicast).Address.lpSockaddr };
+                        if !address.is_null() {
+                            match unsafe { (*address).sa_family } {
+                                AF_INET => {
+                                    let sa = unsafe { &*(address as *const SOCKADDR_IN) };
+                                    let bytes = unsafe { sa.sin_addr.S_un.S_addr }.to_ne_bytes();
+                                    result.insert(IpAddr::V4(Ipv4Addr::from(bytes)));
+                                }
+                                AF_INET6 => {
+                                    let sa = unsafe { &*(address as *const SOCKADDR_IN6) };
+                                    let bytes = unsafe { sa.sin6_addr.u.Byte };
+                                    result.insert(IpAddr::V6(std::net::Ipv6Addr::from(bytes)));
+                                }
+                                _ => {}
+                            }
+                        }
+                        unicast = unsafe { (*unicast).Next };
+                    }
+                    node = unsafe { (*node).Next };
+                }
+                return Ok(result);
+            }
+            ERROR_BUFFER_OVERFLOW => continue,
+            other => return Err(io::Error::from_raw_os_error(other as i32)),
+        }
+    }
+    Err(io::Error::from_raw_os_error(ERROR_BUFFER_OVERFLOW as i32))
 }
 
 pub struct Broker {
@@ -891,7 +951,6 @@ mod upstream_tests {
         String::from_utf8_lossy(&answer[..filled]).into_owned()
     }
 
-    #[cfg_attr(windows, ignore = "egress cannot list host interfaces on Windows yet")]
     #[tokio::test]
     async fn an_allowed_address_goes_out_through_the_upstream_proxy() {
         let (proxy, mut heads) = fake_proxy().await;
@@ -915,7 +974,6 @@ mod upstream_tests {
         broker.shutdown().await;
     }
 
-    #[cfg_attr(windows, ignore = "egress cannot list host interfaces on Windows yet")]
     #[tokio::test]
     async fn the_policy_still_refuses_a_private_address_before_the_upstream_sees_it() {
         let (proxy, mut heads) = fake_proxy().await;
@@ -940,7 +998,6 @@ mod upstream_tests {
         broker.shutdown().await;
     }
 
-    #[cfg_attr(windows, ignore = "egress cannot list host interfaces on Windows yet")]
     #[tokio::test]
     async fn a_proxy_the_broker_cannot_speak_never_becomes_a_direct_connection() {
         let policy = Policy {
